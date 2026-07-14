@@ -16,7 +16,20 @@ Create or update `.claude/settings.json` in your project root:
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/skill-activation-prompt.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/skill-activation-prompt.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|MultiEdit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/skill-verification-guard.sh",
+            "timeout": 15
           }
         ]
       }
@@ -27,7 +40,18 @@ Create or update `.claude/settings.json` in your project root:
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post-tool-use-tracker.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post-tool-use-tracker.sh",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/skill-activation-tracker.sh",
+            "timeout": 10
           }
         ]
       }
@@ -37,15 +61,8 @@ Create or update `.claude/settings.json` in your project root:
         "hooks": [
           {
             "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-prettier-formatter.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-build-check-enhanced.sh"
-          },
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/error-handling-reminder.sh"
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-doc-updater.sh",
+            "timeout": 30
           }
         ]
       }
@@ -53,6 +70,8 @@ Create or update `.claude/settings.json` in your project root:
   }
 }
 ```
+
+Note: JSON keys must be unique — both PostToolUse hooks (the edit tracker and the skill tracker) live as two matcher objects inside the **single** `PostToolUse` array. Declaring `PostToolUse` twice would silently drop the first registration.
 
 ### 2. Install Dependencies
 
@@ -131,25 +150,6 @@ if [[ "$repo" == "my-service" ]]; then
 fi
 ```
 
-### Prettier Configuration
-
-The prettier hook searches for configs in this order:
-1. Current file directory (walking upward)
-2. Project root
-3. Falls back to Prettier defaults
-
-#### Custom Prettier Config Search
-
-Edit `.claude/hooks/stop-prettier-formatter.sh`, function `get_prettier_config()`:
-
-```bash
-# Add custom config locations
-if [[ -f "$project_root/config/.prettierrc" ]]; then
-    echo "$project_root/config/.prettierrc"
-    return
-fi
-```
-
 ### Error Handling Reminders
 
 Configure file category detection in `.claude/hooks/error-handling-reminder.ts`:
@@ -175,7 +175,92 @@ if [[ $total_errors -ge 10 ]]; then  # Now requires 10+ errors
 fi
 ```
 
+## AI Provider Configuration (v2.0)
+
+### Activation Modes
+
+Set in `.claude/skills/skill-rules.json`:
+
+```json
+{
+    "settings": {
+        "skill_activation_mode": "disabled",
+        "conservativeness": "balanced"
+    }
+}
+```
+
+| Mode | Behavior |
+|------|----------|
+| `disabled` | Regex-only (default, v1.0 behavior) |
+| `fallback` | AI first, regex on failure |
+| `ai-only` | Pure AI, no fallback |
+
+### AI Is Suggest-Only by Default
+
+In AI mode, classifications never arm hard blocks unless you opt in with `"ai_can_arm_blocks": true` in `settings`. Reason: on the 2026-07 held-out benchmark of real prompts, Gemini classification had perfect recall but false-alarmed on roughly a third of off-topic prompts — good enough to suggest, not good enough to block edits. Regex intent patterns (deterministic, auditable) remain the only default path to a mandatory block.
+
+### Provider Selection
+
+Auto-detected from environment, or force with `SKILL_AI_PROVIDER`:
+
+```bash
+export SKILL_AI_PROVIDER=gemini  # gemini|openai|anthropic|ollama
+```
+
+### Conservativeness
+
+Controls suggestion aggressiveness in AI mode:
+
+```bash
+export SKILL_CONSERVATIVENESS=balanced  # strict|balanced|aggressive
+```
+
+### PreToolUse Guard
+
+The `skill-verification-guard` hook analyzes code being edited:
+
+```bash
+# Soft-block: block first edit with suggestions, allow second
+export PRETOOLUSE_SOFT_BLOCK=false
+
+# Skip mandatory skill enforcement
+export SKIP_MANDATORY_SKILLS=false
+
+# Skip AI analysis in PreToolUse
+export SKIP_PRETOOLUSE_AI=false
+
+# Detailed debug logging
+export SKILL_GUARD_DEBUG=false
+```
+
+### Debug Mode
+
+```bash
+export DEBUG_SKILLS=1  # Show AI classification details in stderr
+```
+
 ## Environment Variables
+
+### AI Provider Variables
+
+```bash
+# Force specific provider
+SKILL_AI_PROVIDER=gemini|openai|anthropic|ollama
+
+# Provider API keys (auto-detection uses these)
+GEMINI_API_KEY=your-key
+OPENAI_API_KEY=your-key
+ANTHROPIC_API_KEY=your-key
+
+# OpenAI/Azure customization
+OPENAI_BASE_URL=https://your-endpoint.openai.azure.com
+OPENAI_MODEL=gpt-4o-mini
+
+# Ollama customization
+OLLAMA_MODEL=llama3.2
+OLLAMA_BASE_URL=http://localhost:11434
+```
 
 ### Global Environment Variables
 
@@ -271,35 +356,7 @@ You don't need all hooks. Choose what works for your project:
 }
 ```
 
-### Formatting Only (No Build Checking)
-
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Edit|MultiEdit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/post-tool-use-tracker.sh"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-prettier-formatter.sh"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+> Note: A Prettier formatting Stop hook is not included in this showcase. If you have your own formatter hook, register it as a Stop hook using the same pattern as the build-check example above.
 
 ## Cache Management
 
@@ -321,7 +378,29 @@ rm -rf $CLAUDE_PROJECT_DIR/.claude/tsc-cache/[session-id]
 
 ### Automatic Cleanup
 
-The build-check hook automatically cleans up session cache on successful builds.
+The wired Stop hook (`session-doc-updater.sh`) prunes session-state files and tsc-cache directories older than 7 days on every stop. If you additionally wire `stop-build-check-enhanced.sh`, it removes the current session's cache immediately after a successful build.
+
+## Using the Hooks from Codex CLI
+
+Codex's hooks system is wire-compatible with these scripts. `.codex/hooks.json` registers them via `.codex/hooks/_codex-adapter.sh`, which sets `CLAUDE_PROJECT_DIR` and translates `apply_patch` events into per-file guard checks — no forked code. See the README's "Works with Codex Too" section for setup (native install + one-time hook trust prompt).
+
+## Activation Telemetry
+
+The skill hooks append one JSONL line per suggestion, activation, and block to:
+
+```
+$CLAUDE_PROJECT_DIR/.claude/hooks/state/metrics.jsonl
+```
+
+Events: `suggested` (skill, level mandatory/recommended, source regex/gemini/...), `activated` (Skill tool used), `blocked` (kind mandatory/guardrail/ai-soft, file). The file rotates once at 10 MB (`metrics.jsonl.1`); sessions whose id starts with `bench-` are excluded so benchmark runs don't pollute real-usage data.
+
+View the report:
+
+```bash
+.claude/scripts/skill-stats.sh
+```
+
+It shows, per skill: how many sessions it was suggested in, how often a suggestion was followed by an activation in the same session (conversion), how often it was activated with no suggestion at all (the model found it on its own), and block counts by kind. Over time this tells you which triggers earn their keep in *your* real usage — the same data the repo's benchmark had to reconstruct by hand.
 
 ## Troubleshooting Configuration
 
@@ -353,15 +432,6 @@ fi
 1. Limit TypeScript checks to changed files only
 2. Use faster package managers (pnpm > npm)
 3. Add more skip conditions
-4. Disable Prettier for large files
-
-```bash
-# Skip large files in stop-prettier-formatter.sh
-file_size=$(wc -c < "$file" 2>/dev/null || echo 0)
-if [[ $file_size -gt 100000 ]]; then  # Skip files > 100KB
-    continue
-fi
-```
 
 ### Debugging Hooks
 
@@ -444,5 +514,4 @@ fi
 ## See Also
 
 - [README.md](./README.md) - Hooks overview
-- [../../docs/HOOKS_SYSTEM.md](../../docs/HOOKS_SYSTEM.md) - Complete hooks reference
-- [../../docs/SKILLS_SYSTEM.md](../../docs/SKILLS_SYSTEM.md) - Skills integration
+- [../../README.md](../../README.md) - Project overview and quick start

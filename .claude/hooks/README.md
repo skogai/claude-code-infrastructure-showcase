@@ -110,6 +110,36 @@ chmod +x your-project/.claude/hooks/post-tool-use-tracker.sh
 
 ---
 
+### skill-verification-guard (PreToolUse)
+
+**Purpose:** Enforces mandatory skill activation before Edit/Write/MultiEdit (v2.0)
+
+**How it works:**
+1. Checks whether mandatory skills (flagged by skill-activation-prompt) are still pending
+2. First edit attempt: BLOCKED with a reminder, pending list cleared
+3. Second attempt: allowed (two-try model)
+4. Optionally analyzes the code being written for skill suggestions (AI mode)
+
+**Why it's essential:** Suggestions alone get ignored; this provides the enforcement.
+
+**Integration:** copy `skill-verification-guard.sh` + `.ts`, register under `PreToolUse` with matcher `Edit|MultiEdit|Write` (see the shipped settings.json).
+
+**Customization:** ✅ None needed. Env switches: `SKIP_MANDATORY_SKILLS=true` to bypass, `PRETOOLUSE_SOFT_BLOCK=true` for soft mode.
+
+---
+
+### skill-activation-tracker (PostToolUse: Skill)
+
+**Purpose:** Clears skills from the pending list once they're actually activated via the Skill tool (v2.0)
+
+**Why it's essential:** Without it, the guard would keep blocking even after you activated the skill.
+
+**Integration:** copy `skill-activation-tracker.sh` + `.ts`, register under `PostToolUse` with matcher `Skill` (see the shipped settings.json).
+
+**Customization:** ✅ None needed
+
+---
+
 ## Optional Hooks (Require Customization)
 
 ### tsc-check (Stop)
@@ -140,11 +170,37 @@ chmod +x your-project/.claude/hooks/post-tool-use-tracker.sh
 
 ### trigger-build-resolver (Stop)
 
-**Purpose:** Auto-launches build-error-resolver agent when compilation fails
+**Purpose:** Auto-launches auto-error-resolver agent when compilation fails
 
 **Depends on:** tsc-check hook working correctly
 
 **Customization:** ✅ None (but tsc-check must work first)
+
+---
+
+### stop-build-check-enhanced (Stop)
+
+**Purpose:** Alternative Stop-hook build check with error summaries fed back to Claude
+
+**Customization:** ⚠️ Moderate - expects a TypeScript build setup; review before enabling
+
+---
+
+### error-handling-reminder (Stop)
+
+**Purpose:** Reminds Claude to add error handling/Sentry coverage for files edited this session
+
+**Customization:** ⚠️ Moderate - assumes the tsc-cache tracking from post-tool-use-tracker
+
+---
+
+### session-doc-updater (Stop)
+
+**Purpose:** Part of the session-intelligence system - indexes your active dev-docs task (plan/context files) into a local vector DB so past session knowledge is searchable
+
+**Installed by default** in the shipped settings.json, but it no-ops instantly until you set up session indexing (it requires `data/sessions.db`, created by `.claude/scripts/index-sessions.ts`, plus a `dev/active/` task and a `GEMINI_API_KEY` for embeddings). See [CONFIG.md](CONFIG.md).
+
+**Customization:** ✅ None needed. Disable any time with `SESSION_DOCS_ENABLED=false`.
 
 ---
 
@@ -153,7 +209,7 @@ chmod +x your-project/.claude/hooks/post-tool-use-tracker.sh
 **When setting up hooks for a user:**
 
 1. **Read [CLAUDE_INTEGRATION_GUIDE.md](../../CLAUDE_INTEGRATION_GUIDE.md)** first
-2. **Always start with the two essential hooks**
+2. **Always start with the four essential hooks**
 3. **Ask before adding Stop hooks** - they can block if misconfigured  
 4. **Verify after setup:**
    ```bash

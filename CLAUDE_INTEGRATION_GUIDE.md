@@ -2,6 +2,23 @@
 
 **FOR CLAUDE CODE:** When a user asks you to integrate components from this showcase repository into their project, follow these instructions carefully.
 
+## Table of Contents
+
+- [Overview](#overview)
+- [Setup Wizard (Fastest Path)](#setup-wizard-fastest-path)
+- [Choosing Classic vs AI-Enhanced Mode](#choosing-classic-vs-ai-enhanced-mode)
+- [AI Provider Setup](#ai-provider-setup)
+- [Conservativeness Tuning](#conservativeness-tuning)
+- [PreToolUse Guard](#pretooluse-guard)
+- [Tech Stack Compatibility Check](#tech-stack-compatibility-check)
+- [General Integration Pattern](#general-integration-pattern)
+- [Integrating Skills](#integrating-skills)
+- [Adapting Skills for Different Tech Stacks](#adapting-skills-for-different-tech-stacks)
+- [Verification Checklist](#verification-checklist)
+- [Common Mistakes to Avoid](#common-mistakes-to-avoid)
+- [Example Integration Conversations](#example-integration-conversations)
+- [Quick Reference Tables](#quick-reference-tables)
+
 ---
 
 ## Overview
@@ -14,6 +31,136 @@ This repository is a **reference library** of Claude Code infrastructure compone
 4. **Verify the integration** works correctly
 
 **Key Principle:** ALWAYS ask before assuming project structure. What works for one project won't work for another.
+
+---
+
+## Setup Wizard (Fastest Path)
+
+For users who want the quickest setup:
+
+```bash
+npx tsx setup.ts ~/their-project
+```
+
+The wizard:
+1. Detects the project's tech stack (React, Express, Prisma, etc.)
+2. Asks: Classic (regex-only) or AI-Enhanced mode?
+3. If AI: Which provider? Validates API key / Ollama availability
+4. Configures conservativeness level
+5. Updates `skill-rules.json` with v2.0 settings
+6. Installs dependencies
+7. Runs the health check (`.claude/scripts/verify-setup.sh`) to verify its own work
+
+**IMPORTANT - when YOU (Claude) run the wizard:** the interactive prompts do not work over piped stdin, and the wizard exits with an error if you try. ALWAYS pass `--yes` with an explicit absolute target path:
+
+```bash
+npx tsx setup.ts /absolute/path/to/their-project --yes
+# Optional flags: --mode disabled|fallback|ai-only   --provider auto|gemini|openai|anthropic|ollama
+#                 --conservativeness strict|balanced|aggressive   --editor
+```
+
+Defaults are safe (`--mode disabled` = regex-only, no API key needed). After it finishes, report the verification results to the user and fix any [FAIL] items.
+
+**After the wizard:** Users can fine-tune by editing `.claude/skills/skill-rules.json`.
+
+---
+
+## Choosing Classic vs AI-Enhanced Mode
+
+| | Classic (disabled) | AI-Enhanced (fallback) | AI-Only |
+|---|---|---|---|
+| **How it works** | Regex/keyword matching | AI first, regex fallback | Pure AI |
+| **Cost** | Free | ~$0.001/prompt | ~$0.001/prompt |
+| **Offline** | Yes | Graceful fallback | No |
+| **Accuracy** | Good for keywords | Better semantic match | Best accuracy |
+| **Setup** | Zero config | API key needed | API key needed |
+| **Default** | **Yes** | No | No |
+
+**Recommendation:** Start with Classic mode. If you find skills aren't activating when expected, switch to `fallback` mode with Gemini (free tier).
+
+---
+
+## AI Provider Setup
+
+### Gemini (Recommended - Free Tier)
+
+```bash
+# 1. Get free API key: https://aistudio.google.com/apikey
+# 2. Add to ~/.bashrc:
+export GEMINI_API_KEY=your-key-here
+# 3. Update skill-rules.json:
+#    "skill_activation_mode": "fallback"
+```
+
+### OpenAI
+
+```bash
+export OPENAI_API_KEY=your-key-here
+# Optional for Azure:
+export OPENAI_BASE_URL=https://your-endpoint.openai.azure.com
+```
+
+### Anthropic
+
+```bash
+export ANTHROPIC_API_KEY=your-key-here
+```
+
+### Ollama (Free, Local)
+
+```bash
+# 1. Install: https://ollama.ai
+# 2. Pull model:
+ollama pull llama3.2
+# 3. Start server:
+ollama serve
+# No API key needed!
+```
+
+### Provider Auto-Detection
+
+If no `SKILL_AI_PROVIDER` is set, detection tries in order:
+1. `GEMINI_API_KEY` present -> Gemini
+2. `OPENAI_API_KEY` present -> OpenAI
+3. `ANTHROPIC_API_KEY` present -> Anthropic
+4. Ollama ping (500ms timeout) -> Ollama
+5. No provider -> regex-only fallback
+
+Override with: `export SKILL_AI_PROVIDER=gemini`
+
+---
+
+## Conservativeness Tuning
+
+Controls how aggressively skills are suggested in AI mode:
+
+| Level | Description | Best For |
+|-------|-------------|----------|
+| **strict** | Only suggest when user explicitly states intent. Minimizes false positives. | Large skill sets, experienced users |
+| **balanced** | Standard behavior. Mandatory = direct work, Recommended = context mentions. | Most projects (default) |
+| **aggressive** | Suggest liberally. Catches tangential mentions. | New users, small skill sets |
+
+Set via environment: `export SKILL_CONSERVATIVENESS=strict`
+Or in `skill-rules.json`: `"settings": { "conservativeness": "strict" }`
+
+---
+
+## PreToolUse Guard
+
+The `skill-verification-guard` hook (new in v2.0) runs before Edit/Write/MultiEdit:
+
+1. **Mandatory enforcement:** If mandatory skills are pending (from UserPromptSubmit), blocks the edit until skills are activated. Uses "two-try" model:
+   - First edit: BLOCKED, mandatory_pending cleared
+   - Second edit: ALLOWED
+
+2. **AI-powered edit analysis:** Analyzes code being written to suggest relevant skills (if AI provider available)
+
+3. **Guardrail checks:** Matches file paths and content patterns from skill-rules.json
+
+**Configuration:**
+- `PRETOOLUSE_SOFT_BLOCK=true` - Block on AI suggestions (default: suggest only)
+- `SKIP_MANDATORY_SKILLS=true` - Bypass mandatory enforcement
+- `SKILL_GUARD_DEBUG=true` - Detailed debug logging
 
 ---
 
@@ -68,7 +215,6 @@ Which would you prefer?
 
 These work for ANY tech stack:
 - ✅ **skill-developer** - Meta-skill, no tech requirements
-- ✅ **route-tester** - Only requires JWT cookie auth (framework agnostic)
 - ✅ **error-tracking** - Sentry works with most stacks
 
 ---
@@ -199,13 +345,6 @@ cat $CLAUDE_PROJECT_DIR/.claude/skills/skill-rules.json | jq .
 - **Customize:** pathPatterns + all framework-specific examples
 - **Example paths:** `frontend/`, `client/`, `web/`, `apps/web/src/`
 - **Adaptation tip:** File organization and performance patterns transfer, component code doesn't
-
-#### route-tester
-- **Tech Requirements:** JWT cookie-based authentication (framework agnostic)
-- **Ask:** "Do you use JWT cookie-based authentication?"
-- **If NO:** "This skill is designed for JWT cookies. Want me to adapt it for [their auth type] or skip it?"
-- **Customize:** Service URLs, auth patterns
-- **Works with:** Any backend framework using JWT cookies
 
 #### error-tracking
 - **Tech Requirements:** Sentry (works with most backends)
@@ -511,11 +650,6 @@ sed -i 's|/root/git/.*PROJECT.*DIR|$CLAUDE_PROJECT_DIR|g' \\
 
 ### Agent-Specific Notes
 
-**auth-route-tester / auth-route-debugger:**
-- Requires JWT cookie-based authentication in user's project
-- Ask: "Do you use JWT cookies for auth?"
-- If NO: "These agents are for JWT cookie auth. Skip them or want me to adapt?"
-
 **frontend-error-fixer:**
 - May reference screenshot paths
 - Ask: "Where should screenshots be saved?"
@@ -627,7 +761,15 @@ Instead, **extract and merge** the sections they need:
 
 ## Verification Checklist
 
-After integration, **verify these items:**
+**Fastest path - run the health check script** (8 checks, exact fix command per failure, including an end-to-end test of the activation hook):
+
+```bash
+bash $CLAUDE_PROJECT_DIR/.claude/scripts/verify-setup.sh
+```
+
+Exit 0 = ready (warnings are fine - they cover optional features). Fix any [FAIL] and re-run.
+
+**Manual fallback** if the script isn't present (older install), verify these items:
 
 ```bash
 # 1. Hooks are executable
@@ -655,9 +797,9 @@ cat $CLAUDE_PROJECT_DIR/.claude/settings.json | jq .
 
 ## Common Mistakes to Avoid
 
-### ❌ DON'T: Copy settings.json as-is
-**Why:** The Stop hooks reference non-existent services
-**DO:** Extract only UserPromptSubmit and PostToolUse sections
+### ❌ DON'T: Register the heavy Stop hooks without customizing them
+**Why:** The shipped `settings.json` works as-is - it registers only the safe hooks (skill activation, guard, trackers, session-doc-updater). The build-check Stop hooks (tsc-check, trigger-build-resolver, stop-build-check-enhanced) are NOT registered by default because they expect specific service directories.
+**DO:** Copy `settings.json` as shipped. Only add the build-check Stop hooks after customizing their service lists for the user's project.
 
 ### ❌ DON'T: Keep example service names
 **Why:** User doesn't have blog-api, auth-service, etc.
@@ -836,7 +978,6 @@ Try editing a .vue file - the skill should activate.
 | **skill-developer** | None | ✅ None | Copy as-is |
 | **backend-dev-guidelines** | Express/Prisma/Node | ⚠️ Paths + tech check | "Use Express/Prisma?" "Where's backend?" |
 | **frontend-dev-guidelines** | React/MUI v7 | ⚠️⚠️ Paths + framework | "Use React/MUI v7?" "Where's frontend?" |
-| **route-tester** | JWT cookies | ⚠️ Auth + paths | "JWT cookie auth?" |
 | **error-tracking** | Sentry | ⚠️ Paths | "Use Sentry?" "Where's backend?" |
 | **skill-activation-prompt** | ✅ None | Copy as-is |
 | **post-tool-use-tracker** | ✅ None | Copy as-is |
@@ -849,9 +990,7 @@ Try editing a .vue file - the skill should activate.
 | Component | Skip If... |
 |-----------|-----------|
 | **tsc-check hooks** | Single-service project or different build setup |
-| **route-tester** | Not using JWT cookie authentication |
 | **frontend-dev-guidelines** | Not using React + MUI |
-| **auth agents** | Not using JWT cookie auth |
 
 ---
 
@@ -859,7 +998,7 @@ Try editing a .vue file - the skill should activate.
 
 **When user says "add everything":**
 - Start with essentials: skill-activation hooks + 1-2 relevant skills
-- Don't overwhelm them with all 5 skills + 10 agents
+- Don't overwhelm them with all 4 skills + 8 agents
 - Ask what they actually need
 
 **When something doesn't work:**

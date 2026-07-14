@@ -1,5 +1,3 @@
 #!/bin/bash
-set -e
-
-cd "$CLAUDE_PROJECT_DIR/.claude/hooks"
-cat | npx tsx skill-activation-prompt.ts
+# UserPromptSubmit hook - skill suggestions + session intelligence
+exec "$(dirname "$0")/_run-node-hook.sh" skill-activation-prompt.ts

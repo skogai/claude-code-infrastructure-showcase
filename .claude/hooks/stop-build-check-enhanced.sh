@@ -7,6 +7,12 @@ set -e
 # Read event information from stdin
 event_info=$(cat)
 
+# jq is required to parse hook input
+if ! command -v jq >/dev/null 2>&1; then
+    echo "claude hooks: jq is required for this hook - install jq or remove the hook from settings.json" >&2
+    exit 0
+fi
+
 # Extract session ID
 session_id=$(echo "$event_info" | jq -r '.session_id // empty')
 
@@ -51,7 +57,7 @@ while IFS= read -r repo; do
     fi
     
     # Run TSC and capture output
-    if ! output=$(eval "$tsc_cmd" 2>&1); then
+    if ! output=$(bash -c "$tsc_cmd" 2>&1); then
         # TSC failed - we have errors
         has_errors=true
         
@@ -110,7 +116,9 @@ if [[ "$has_errors" == "true" ]]; then
         echo "" >&2
         
         # Show all errors for minor count
-        cat "$cache_dir/last-errors.txt" | sed 's/^/  /' >&2
+        while IFS= read -r line; do
+            echo "  $line" >&2
+        done < "$cache_dir/last-errors.txt"
         echo "" >&2
         echo "Please fix these errors directly in the affected files." >&2
         

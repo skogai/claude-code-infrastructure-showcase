@@ -12,12 +12,8 @@ interface HookInput {
 
 interface EditedFile {
     path: string;
-    tool: string;
+    repo: string;
     timestamp: string;
-}
-
-interface SessionTracking {
-    edited_files: EditedFile[];
 }
 
 function getFileCategory(filePath: string): 'backend' | 'frontend' | 'database' | 'other' {
@@ -85,7 +81,9 @@ async function main() {
         const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 
         // Check for edited files tracking
-        const cacheDir = join(process.env.HOME || '/root', '.claude', 'tsc-cache', session_id);
+        const cacheDir = process.env.CLAUDE_PROJECT_DIR
+            ? join(projectDir, '.claude', 'tsc-cache', session_id)
+            : join(process.env.HOME || '/root', '.claude', 'tsc-cache', session_id);
         const trackingFile = join(cacheDir, 'edited-files.log');
 
         if (!existsSync(trackingFile)) {
@@ -93,16 +91,18 @@ async function main() {
             process.exit(0);
         }
 
-        // Read tracking data
+        // Read tracking data (written by post-tool-use-tracker.sh as
+        // tab-delimited: timestamp, file path, repo)
         const trackingContent = readFileSync(trackingFile, 'utf-8');
-        const editedFiles = trackingContent
+        const editedFiles: EditedFile[] = trackingContent
             .trim()
             .split('\n')
             .filter(line => line.length > 0)
             .map(line => {
-                const [timestamp, tool, path] = line.split('\t');
-                return { timestamp, tool, path };
-            });
+                const [timestamp, path, repo] = line.split('\t');
+                return { timestamp, path, repo };
+            })
+            .filter(f => !!f.path);
 
         if (editedFiles.length === 0) {
             process.exit(0);

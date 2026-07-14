@@ -18,26 +18,21 @@
  *
  * Conservativeness levels: strict | balanced | aggressive
  */
-
 import { readFileSync, existsSync, writeFileSync, mkdirSync, readdirSync, statSync, appendFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import type { AIProvider } from './providers/ai-provider.js';
 import { EMPTY_CLASSIFICATION } from './providers/ai-provider.js';
 import { parseLLMJson } from './providers/parse-llm-json.js';
 import { createProvider } from './providers/provider-factory.js';
 import { loadSessionState, updateSessionState } from './lib/session-state.js';
 import { recordMetric } from './lib/metrics.js';
-
 // Session intelligence imports (graceful - won't crash if lib/ missing)
-let VectorStore: typeof import('./lib/vector-store.js').VectorStore | null = null;
-let createEmbeddingProvider: typeof import('./lib/embeddings.js').createEmbeddingProvider | null = null;
-let generateSearchTerms: typeof import('./lib/gemini-client.js').generateSearchTerms | null = null;
-let assessRelevance: typeof import('./lib/gemini-client.js').assessRelevance | null = null;
-
+let VectorStore = null;
+let createEmbeddingProvider = null;
+let generateSearchTerms = null;
+let assessRelevance = null;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-
 // Try to load session intelligence libraries
 try {
     const vectorMod = await import('./lib/vector-store.js');
@@ -47,117 +42,21 @@ try {
     createEmbeddingProvider = embedMod.createEmbeddingProvider;
     generateSearchTerms = geminiMod.generateSearchTerms;
     assessRelevance = geminiMod.assessRelevance;
-} catch {
+}
+catch {
     // Session intelligence libraries not available - vector search disabled
 }
-
-// ============================================================
-// TYPE DEFINITIONS
-// ============================================================
-
-type ConservativenessLevel = 'strict' | 'balanced' | 'aggressive';
-type ActivationMode = 'disabled' | 'fallback' | 'ai-only';
-type SearchQuality = 'fast' | 'moderate' | 'quality';
-
-interface SkillRulesSettings {
-    skill_activation_mode?: ActivationMode;
-    conservativeness?: ConservativenessLevel;
-    ai_can_arm_blocks?: boolean;
-}
-
-interface HookInput {
-    session_id: string;
-    transcript_path: string;
-    cwd: string;
-    permission_mode: string;
-    prompt: string;
-}
-
-interface PromptTriggers {
-    keywords?: string[];
-    intentPatterns?: string[];
-}
-
-interface SkillRule {
-    type: 'guardrail' | 'domain';
-    enforcement: 'block' | 'suggest' | 'warn';
-    priority: 'critical' | 'high' | 'medium' | 'low';
-    promptTriggers?: PromptTriggers;
-    description?: string;
-}
-
-interface SkillRules {
-    version: string;
-    settings?: SkillRulesSettings;
-    skills: Record<string, SkillRule>;
-}
-
-interface MatchedSkill {
-    name: string;
-    matchType: 'keyword' | 'intent';
-    config: SkillRule;
-}
-
-interface ClassificationResult {
-    mandatory: string[];
-    recommended: string[];
-}
-
-interface VectorSearchResult {
-    sessionId: string;
-    sourceType: 'session' | 'devdoc';
-    chunkType: string;
-    chunkText: string;
-    score: number;
-}
-
-interface RelevanceAssessment {
-    relevant: boolean;
-    score: number;
-    keyFiles: string[];
-    keyDecisions: string[];
-    condensedContext: string;
-}
-
-interface DocUpdateState {
-    sessionId: string;
-    lastUpdateTime: number;
-    lastUpdateTurn: number;
-    turnCount: number;
-}
-
-interface SessionIntelData {
-    ts: string;
-    session: string;
-    skills: {
-        mandatory: string[];
-        recommended: string[];
-        source: string;
-        ms: number;
-    };
-    search: {
-        quality: string;
-        hits: number;
-        top: Array<{ id: string; score: number }>;
-        relevant: boolean | null;
-        ms: number;
-    } | null;
-    reminder: string;
-}
-
 // ============================================================
 // CONSERVATIVENESS LEVEL FUNCTIONS
 // ============================================================
-
-function getConservativenessLevel(settings?: SkillRulesSettings): ConservativenessLevel {
+function getConservativenessLevel(settings) {
     const envLevel = process.env.SKILL_CONSERVATIVENESS;
     if (envLevel && ['strict', 'balanced', 'aggressive'].includes(envLevel)) {
-        return envLevel as ConservativenessLevel;
+        return envLevel;
     }
     return settings?.conservativeness || 'balanced';
 }
-
-function getConservativenessInstructions(level: ConservativenessLevel): string {
+function getConservativenessInstructions(level) {
     switch (level) {
         case 'strict':
             return `
@@ -177,7 +76,6 @@ STRICT EXAMPLES:
 - "create a React component" -> frontend-dev-guidelines MANDATORY
 - "fix the workflow" -> RECOMMENDED only (could be data fix, not code)
 - "add error handling" -> RECOMMENDED only (could be any service)`;
-
         case 'aggressive':
             return `
 CONSERVATIVENESS: AGGRESSIVE (catch everything)
@@ -195,7 +93,6 @@ AGGRESSIVE EXAMPLES:
 - "update the form" -> form skill MANDATORY, backend MANDATORY, frontend MANDATORY
 - "fix the workflow" -> workflow skill MANDATORY, backend MANDATORY
 - "component that might need database" -> frontend MANDATORY, database MANDATORY`;
-
         case 'balanced':
         default:
             return `
@@ -211,23 +108,15 @@ BALANCED EXAMPLES:
 - "route that queries the database" -> backend MANDATORY, database RECOMMENDED`;
     }
 }
-
 // ============================================================
 // CLASSIFICATION FUNCTIONS
 // ============================================================
-
-function generatePromptClassificationPrompt(
-    rules: SkillRules,
-    userPrompt: string,
-    conservativeness: ConservativenessLevel = 'balanced'
-): string {
+function generatePromptClassificationPrompt(rules, userPrompt, conservativeness = 'balanced') {
     const skillList = Object.entries(rules.skills)
         .filter(([_, config]) => config.description)
         .map(([skillName, config]) => `- "${skillName}" - ${config.description}`)
         .join('\n');
-
     const conservativenessInstructions = getConservativenessInstructions(conservativeness);
-
     return `You are a skill classifier for a software project.
 Your job is to identify which skills are needed based on the conservativeness level below.
 
@@ -250,54 +139,42 @@ LIMITS:
 Return ONLY valid JSON:
 {"mandatory": ["exact-skill-name"], "recommended": ["exact-skill-name"]}`;
 }
-
-async function classifyWithAI(
-    provider: AIProvider,
-    prompt: string,
-    rules: SkillRules,
-    conservativeness: ConservativenessLevel = 'balanced'
-): Promise<ClassificationResult> {
+async function classifyWithAI(provider, prompt, rules, conservativeness = 'balanced') {
     const classificationPrompt = generatePromptClassificationPrompt(rules, prompt, conservativeness);
-
     try {
         const text = await provider.classifyPrompt(classificationPrompt);
-
         if (process.env.DEBUG_SKILLS === '1') {
             console.error(`[${provider.name}] Raw response:`, text.substring(0, 500));
         }
-
         const result = parseLLMJson(text);
         if (result && typeof result === 'object') {
             const mandatory = Array.isArray(result.mandatory)
-                ? result.mandatory.filter((s: unknown) => typeof s === 'string')
+                ? result.mandatory.filter((s) => typeof s === 'string')
                 : [];
             const recommended = Array.isArray(result.recommended)
-                ? result.recommended.filter((s: unknown) => typeof s === 'string')
+                ? result.recommended.filter((s) => typeof s === 'string')
                 : [];
             return { mandatory, recommended };
         }
-
         return EMPTY_CLASSIFICATION;
-    } catch (error) {
+    }
+    catch (error) {
         if (process.env.DEBUG_SKILLS === '1') {
             console.error(`[${provider.name}] Classification error:`, error);
         }
         return EMPTY_CLASSIFICATION;
     }
 }
-
 // ============================================================
 // FALLBACK KEYWORD MATCHING
 // ============================================================
-
-function fallbackKeywordMatch(prompt: string, rules: SkillRules): MatchedSkill[] {
-    const matchedSkills: MatchedSkill[] = [];
+function fallbackKeywordMatch(prompt, rules) {
+    const matchedSkills = [];
     const lowerPrompt = prompt.toLowerCase();
-
     for (const [skillName, config] of Object.entries(rules.skills)) {
         const triggers = config.promptTriggers;
-        if (!triggers) continue;
-
+        if (!triggers)
+            continue;
         if (triggers.intentPatterns) {
             const intentMatch = triggers.intentPatterns.some(pattern => {
                 const regex = new RegExp(pattern, 'i');
@@ -308,21 +185,16 @@ function fallbackKeywordMatch(prompt: string, rules: SkillRules): MatchedSkill[]
                 continue;
             }
         }
-
         if (triggers.keywords) {
-            const keywordMatch = triggers.keywords.some(kw =>
-                lowerPrompt.includes(kw.toLowerCase())
-            );
+            const keywordMatch = triggers.keywords.some(kw => lowerPrompt.includes(kw.toLowerCase()));
             if (keywordMatch) {
                 matchedSkills.push({ name: skillName, matchType: 'keyword', config });
             }
         }
     }
-
     return matchedSkills;
 }
-
-function fallbackToClassificationResult(matched: MatchedSkill[]): ClassificationResult {
+function fallbackToClassificationResult(matched) {
     // Only enforcement: "block" skills may demand mandatory activation (and be
     // enforced by the PreToolUse guard); suggest/warn skills stay advisory no
     // matter how strong the trigger match is.
@@ -334,8 +206,7 @@ function fallbackToClassificationResult(matched: MatchedSkill[]): Classification
         .map(s => s.name);
     return { mandatory, recommended };
 }
-
-function enforceMandatoryEligibility(result: ClassificationResult, rules: SkillRules): ClassificationResult {
+function enforceMandatoryEligibility(result, rules) {
     // AI classification is suggest-only by default: on real-world prompts it
     // over-triggers (~1/3 of off-topic prompts in the 2026-07 held-out
     // benchmark), so letting it arm hard blocks means wrong blocks. Opt in
@@ -348,18 +219,11 @@ function enforceMandatoryEligibility(result: ClassificationResult, rules: SkillR
     const recommended = [...new Set([...demoted, ...result.recommended.filter(s => rules.skills[s])])];
     return { mandatory, recommended };
 }
-
 // ============================================================
 // OUTPUT FORMATTING
 // ============================================================
-
-function generateTieredOutput(
-    mandatory: string[],
-    recommended: string[],
-    source: string = 'LLM'
-): string {
+function generateTieredOutput(mandatory, recommended, source = 'LLM') {
     let output = '';
-
     if (mandatory.length > 0) {
         output += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
         output += '⛔ MANDATORY SKILL ACTIVATION REQUIRED\n';
@@ -367,18 +231,17 @@ function generateTieredOutput(
         output += 'You MUST activate these skills BEFORE any action:\n';
         mandatory.forEach(s => output += `  → ${s}\n`);
         output += '\n';
-
         if (recommended.length > 0) {
             output += '📚 RECOMMENDED SKILLS:\n';
             recommended.forEach(s => output += `  → ${s}\n`);
             output += '\n';
         }
-
         output += '⚠️ EDITS WILL BE BLOCKED until mandatory skills are activated.\n';
         output += 'Your FIRST action must be: Skill tool calls.\n';
         output += `[via ${source}]\n`;
         output += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
-    } else if (recommended.length > 0) {
+    }
+    else if (recommended.length > 0) {
         output += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
         output += '🎯 SKILL ACTIVATION CHECK\n';
         output += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n';
@@ -389,60 +252,46 @@ function generateTieredOutput(
         output += `[via ${source}]\n`;
         output += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
     }
-
     return output;
 }
-
 // ============================================================
 // SESSION INTELLIGENCE - VECTOR SEARCH
 // ============================================================
-
-async function searchRelevantSessions(
-    prompt: string,
-    quality: SearchQuality = 'quality',
-): Promise<{ results: VectorSearchResult[]; assessment: RelevanceAssessment | null } | null> {
-    if (!VectorStore || !createEmbeddingProvider) return null;
-
-    const dbPath = join(
-        process.env.CLAUDE_PROJECT_DIR || '.',
-        '.claude', 'hooks', 'data', 'sessions.db',
-    );
-
-    if (!existsSync(dbPath)) return null;
-
+async function searchRelevantSessions(prompt, quality = 'quality') {
+    if (!VectorStore || !createEmbeddingProvider)
+        return null;
+    const dbPath = join(process.env.CLAUDE_PROJECT_DIR || '.', '.claude', 'hooks', 'data', 'sessions.db');
+    if (!existsSync(dbPath))
+        return null;
     const store = new VectorStore(dbPath);
     try {
         const provider = createEmbeddingProvider();
-        let allResults: VectorSearchResult[] = [];
-
+        let allResults = [];
         if (quality === 'fast') {
             const embedding = await provider.embed(prompt);
             allResults = store.search(embedding, { limit: 5, minScore: 0.3, sourceType: 'devdoc' });
             return allResults.length > 0 ? { results: allResults, assessment: null } : null;
         }
-
         if (quality === 'moderate') {
             const embedding = await provider.embed(prompt);
             allResults = store.search(embedding, { limit: 8, minScore: 0.25, sourceType: 'devdoc' });
-            if (allResults.length === 0) return null;
+            if (allResults.length === 0)
+                return null;
             const assessment = assessRelevance ? await assessRelevance(prompt, allResults.slice(0, 5)) : null;
             return { results: allResults, assessment };
         }
-
         // Quality: full pipeline
         const [promptEmbedding, searchTerms] = await Promise.all([
             provider.embed(prompt),
             generateSearchTerms ? generateSearchTerms(prompt) : Promise.resolve([]),
         ]);
-
         // Search with prompt embedding
-        const seenIds = new Set<string>();
+        const seenIds = new Set();
         const promptResults = store.search(promptEmbedding, { limit: 5, minScore: 0.25, sourceType: 'devdoc' });
         for (const r of promptResults) {
             seenIds.add(r.sessionId);
             allResults.push(r);
         }
-
         // Search with each generated search term
         for (const term of searchTerms.slice(0, 3)) {
             const termEmbedding = await provider.embed(term);
@@ -454,33 +303,26 @@ async function searchRelevantSessions(
                 }
             }
         }
-
-        if (allResults.length === 0) return null;
-
+        if (allResults.length === 0)
+            return null;
         // Sort by score, take top results, assess relevance
         allResults.sort((a, b) => b.score - a.score);
         allResults = allResults.slice(0, 8);
-
         const assessment = assessRelevance ? await assessRelevance(prompt, allResults.slice(0, 5)) : null;
         return { results: allResults, assessment };
-    } finally {
+    }
+    finally {
         store.close();
     }
 }
-
-function formatSearchResults(
-    searchResult: { results: VectorSearchResult[]; assessment: RelevanceAssessment | null },
-    quality: SearchQuality,
-): string {
+function formatSearchResults(searchResult, quality) {
     const { results, assessment } = searchResult;
-
     // If Gemini assessed as not relevant, skip
-    if (assessment && !assessment.relevant) return '';
-
+    if (assessment && !assessment.relevant)
+        return '';
     let output = '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
     output += 'RELEVANT PAST CONTEXT\n';
     output += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n';
-
     if (assessment?.condensedContext) {
         output += `${assessment.condensedContext}\n\n`;
         if (assessment.keyFiles?.length > 0) {
@@ -490,7 +332,8 @@ function formatSearchResults(
             output += 'Key decisions:\n';
             assessment.keyDecisions.forEach(d => output += `  - ${d}\n`);
         }
-    } else {
+    }
+    else {
         // No assessment (fast mode) - show raw results
         const topResults = results.slice(0, 3);
         topResults.forEach(r => {
@@ -499,55 +342,50 @@ function formatSearchResults(
             output += `  ${r.chunkText.slice(0, 200).replace(/\n/g, ' ')}\n\n`;
         });
     }
-
     output += `[session-intelligence/${quality}]\n`;
     output += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
-
     return output;
 }
-
 // ============================================================
 // DEV-DOC UPDATE REMINDERS
 // ============================================================
-
 const DOC_UPDATE_TURNS_THRESHOLD = parseInt(process.env.DOC_UPDATE_TURNS || '2', 10);
 const DOC_UPDATE_TIME_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
-
-function checkDevDocUpdateDue(sessionId: string): string | null {
+function checkDevDocUpdateDue(sessionId) {
     try {
         const projectDir = process.env.CLAUDE_PROJECT_DIR || '.';
         const stateFile = join(projectDir, '.claude', 'hooks', 'state', `session-doc-${sessionId}.json`);
-
-        let state: DocUpdateState = { sessionId, lastUpdateTime: 0, lastUpdateTurn: 0, turnCount: 0 };
+        let state = { sessionId, lastUpdateTime: 0, lastUpdateTurn: 0, turnCount: 0 };
         if (existsSync(stateFile)) {
             try {
                 state = { ...state, ...JSON.parse(readFileSync(stateFile, 'utf-8')) };
-            } catch {
+            }
+            catch {
                 // use defaults
             }
         }
-
         // Increment turn counter
         state.turnCount = (state.turnCount || 0) + 1;
-
         const isFirstUpdate = state.lastUpdateTime === 0;
         const turnsSinceUpdate = state.turnCount - state.lastUpdateTurn;
         const timeSinceUpdate = Date.now() - state.lastUpdateTime;
-
         const isDue = isFirstUpdate
             || turnsSinceUpdate >= DOC_UPDATE_TURNS_THRESHOLD
             || timeSinceUpdate >= DOC_UPDATE_TIME_THRESHOLD_MS;
-
         if (!isDue) {
-            try { writeFileSync(stateFile, JSON.stringify(state, null, 2)); } catch {}
+            try {
+                writeFileSync(stateFile, JSON.stringify(state, null, 2));
+            }
+            catch { }
             return null;
         }
-
         // Update state
         state.lastUpdateTime = Date.now();
         state.lastUpdateTurn = state.turnCount;
-        try { writeFileSync(stateFile, JSON.stringify(state, null, 2)); } catch {}
-
+        try {
+            writeFileSync(stateFile, JSON.stringify(state, null, 2));
+        }
+        catch { }
         // List active task dirs for context
         const devActiveDir = join(projectDir, 'dev', 'active');
         const activeTasks = listActiveTaskDirs(devActiveDir);
@@ -556,7 +394,6 @@ function checkDevDocUpdateDue(sessionId: string): string | null {
             : activeTasks.length <= 5
                 ? 'Active tasks:\n' + activeTasks.map(t => `   - /dev/active/${t}/`).join('\n')
                 : `${activeTasks.length} active task directories in /dev/active/. Find the relevant one for your current work.`;
-
         return `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   DEV-DOC REMINDER
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -569,50 +406,52 @@ After completing the user's request:
 
 ${taskListStr}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
-    } catch {
+    }
+    catch {
         return null;
     }
 }
-
-function listActiveTaskDirs(devActiveDir: string): string[] {
+function listActiveTaskDirs(devActiveDir) {
     try {
-        if (!existsSync(devActiveDir)) return [];
+        if (!existsSync(devActiveDir))
+            return [];
         return readdirSync(devActiveDir).filter(entry => {
             try {
                 const fullPath = join(devActiveDir, entry);
-                if (!statSync(fullPath).isDirectory()) return false;
+                if (!statSync(fullPath).isDirectory())
+                    return false;
                 return readdirSync(fullPath).some(f => f.endsWith('.md'));
-            } catch {
+            }
+            catch {
                 return false;
             }
         });
-    } catch {
+    }
+    catch {
         return [];
     }
 }
-
 // ============================================================
 // OBSERVABILITY - STDERR + ACTIVITY LOG
 // ============================================================
-
 const SESSION_INTEL_VERBOSE = parseInt(process.env.SESSION_INTEL_VERBOSE ?? '2', 10);
-
-function logSessionIntel(data: SessionIntelData): void {
+function logSessionIntel(data) {
     // Always write to activity log
     try {
         const logDir = join(__dirname, 'data');
-        if (!existsSync(logDir)) mkdirSync(logDir, { recursive: true });
+        if (!existsSync(logDir))
+            mkdirSync(logDir, { recursive: true });
         const logFile = join(logDir, 'session-intel.log');
         appendFileSync(logFile, JSON.stringify(data) + '\n');
-    } catch {
+    }
+    catch {
         // Non-blocking
     }
-
-    if (SESSION_INTEL_VERBOSE === 0) return;
-
+    if (SESSION_INTEL_VERBOSE === 0)
+        return;
     if (SESSION_INTEL_VERBOSE === 1) {
         // One-line summary
-        const parts: string[] = [];
+        const parts = [];
         if (data.skills.mandatory.length > 0 || data.skills.recommended.length > 0) {
             parts.push(`Skills: ${data.skills.mandatory.length}M/${data.skills.recommended.length}R`);
         }
@@ -628,19 +467,18 @@ function logSessionIntel(data: SessionIntelData): void {
         }
         return;
     }
-
     // Verbose (level 2) - detailed multi-line output
-    const lines: string[] = ['[Session Intel] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'];
-
+    const lines = ['[Session Intel] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'];
     // Skills
     if (data.skills.mandatory.length > 0) {
         lines.push(`  Skills: ${data.skills.mandatory.join(', ')} (MANDATORY) via ${data.skills.source} (${data.skills.ms}ms)`);
-    } else if (data.skills.recommended.length > 0) {
+    }
+    else if (data.skills.recommended.length > 0) {
         lines.push(`  Skills: ${data.skills.recommended.join(', ')} (recommended) via ${data.skills.source} (${data.skills.ms}ms)`);
-    } else {
+    }
+    else {
         lines.push(`  Skills: none via ${data.skills.source} (${data.skills.ms}ms)`);
     }
-
     // Search
     if (data.search) {
         lines.push(`  Search: ${data.search.quality} mode, ${data.search.hits} results (${data.search.ms}ms)`);
@@ -651,33 +489,24 @@ function logSessionIntel(data: SessionIntelData): void {
         if (data.search.relevant !== null) {
             lines.push(`  Assessment: ${data.search.relevant ? 'relevant' : 'not relevant'}`);
         }
-    } else {
+    }
+    else {
         lines.push('  Search: disabled or no DB');
     }
-
     // Reminder
     if (data.reminder !== 'none') {
         lines.push(`  Dev docs: ${data.reminder}`);
     }
-
     lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
     console.error(lines.join('\n'));
 }
-
 // ============================================================
 // TIMEOUT HELPER
 // ============================================================
-
 const AI_TIMEOUT_MS = 10000;
-
-async function withTimeout<T>(
-    promise: Promise<T>,
-    ms: number,
-    onTimeout: () => T,
-    label: string
-): Promise<T> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeoutPromise = new Promise<T>(resolve => {
+async function withTimeout(promise, ms, onTimeout, label) {
+    let timer;
+    const timeoutPromise = new Promise(resolve => {
         timer = setTimeout(() => {
             if (process.env.DEBUG_SKILLS === '1') {
                 console.error(`[DEBUG] ${label} timed out after ${ms}ms, falling back`);
@@ -685,61 +514,53 @@ async function withTimeout<T>(
             resolve(onTimeout());
         }, ms);
     });
-
     try {
         return await Promise.race([promise, timeoutPromise]);
-    } finally {
-        if (timer) clearTimeout(timer);
+    }
+    finally {
+        if (timer)
+            clearTimeout(timer);
         // Swallow late rejections if the promise loses the race
-        promise.catch(() => {});
+        promise.catch(() => { });
     }
 }
-
 // ============================================================
 // MAIN
 // ============================================================
-
 async function main() {
     try {
         const input = readFileSync(0, 'utf-8');
-        const data: HookInput = JSON.parse(input);
+        const data = JSON.parse(input);
         const prompt = data.prompt;
         const sessionId = data.session_id;
-
         // Load skill rules (missing/malformed file = no skills configured, graceful no-op)
         const projectDir = process.env.CLAUDE_PROJECT_DIR || '.';
         const rulesPath = join(projectDir, '.claude', 'skills', 'skill-rules.json');
-        let rules: SkillRules = { version: '1.0', skills: {} };
+        let rules = { version: '1.0', skills: {} };
         try {
             rules = JSON.parse(readFileSync(rulesPath, 'utf-8'));
-        } catch (err) {
+        }
+        catch (err) {
             console.error(`skill-activation-prompt: could not load skill-rules.json (${err instanceof Error ? err.message : String(err)}), continuing without skill suggestions`);
         }
-
         // Get configuration
-        const activationMode: ActivationMode = rules.settings?.skill_activation_mode || 'disabled';
+        const activationMode = rules.settings?.skill_activation_mode || 'disabled';
         const conservativeness = getConservativenessLevel(rules.settings);
         const debug = process.env.DEBUG_SKILLS === '1';
-
         if (debug) {
             console.error(`[DEBUG] Activation mode: ${activationMode}`);
             console.error(`[DEBUG] Conservativeness level: ${conservativeness}`);
         }
-
         // Load session state
         const sessionState = loadSessionState(sessionId);
         const alreadyActivated = new Set(sessionState.skills_used || []);
-
         // === PARALLEL: Skill classification + Vector search ===
         const searchEnabled = process.env.SESSION_SEARCH_ENABLED !== 'false';
-        const searchQuality = (process.env.SESSION_SEARCH_QUALITY || 'quality') as SearchQuality;
-
+        const searchQuality = (process.env.SESSION_SEARCH_QUALITY || 'quality');
         const classifyStart = Date.now();
         const searchStart = Date.now();
-
         // Build classification promise based on mode
-        let classificationPromise: Promise<{ result: ClassificationResult; source: string }>;
-
+        let classificationPromise;
         if (activationMode === 'disabled') {
             classificationPromise = Promise.resolve(() => {
                 const fallbackMatches = fallbackKeywordMatch(prompt, rules);
@@ -752,7 +573,8 @@ async function main() {
                     source: 'regex',
                 };
             }).then(fn => fn());
-        } else {
+        }
+        else {
             const aiClassificationPromise = (async () => {
                 const provider = await createProvider({ warnIfUnavailable: true });
                 if (provider) {
@@ -760,11 +582,10 @@ async function main() {
                     if (debug) {
                         console.error(`[DEBUG] AI result (${provider.name}):`, JSON.stringify(classification));
                     }
-                    const { mandatory: validMandatory, recommended: validRecommended } =
-                        enforceMandatoryEligibility(classification, rules);
-
+                    const { mandatory: validMandatory, recommended: validRecommended } = enforceMandatoryEligibility(classification, rules);
                     if (validMandatory.length === 0 && validRecommended.length === 0 && activationMode === 'fallback') {
-                        if (debug) console.error('[DEBUG] AI returned nothing, falling back to regex');
+                        if (debug)
+                            console.error('[DEBUG] AI returned nothing, falling back to regex');
                         const fallbackMatches = fallbackKeywordMatch(prompt, rules);
                         const fallbackResult = fallbackToClassificationResult(fallbackMatches);
                         return {
@@ -775,7 +596,6 @@ async function main() {
                             source: 'regex-fallback',
                         };
                     }
-
                     return { result: { mandatory: validMandatory, recommended: validRecommended }, source: provider.name };
                 }
                 if (activationMode === 'fallback') {
@@ -792,7 +612,6 @@ async function main() {
                 }
                 return { result: EMPTY_CLASSIFICATION, source: 'none' };
             })();
-
             classificationPromise = withTimeout(aiClassificationPromise, AI_TIMEOUT_MS, () => {
                 const fallbackMatches = fallbackKeywordMatch(prompt, rules);
                 const fallbackResult = fallbackToClassificationResult(fallbackMatches);
@@ -805,36 +624,26 @@ async function main() {
                 };
             }, 'AI classification');
         }
-
         // Run classification + search in parallel
         const [classificationData, searchResult] = await Promise.all([
             classificationPromise,
             searchEnabled
-                ? withTimeout(
-                    searchRelevantSessions(prompt, searchQuality),
-                    AI_TIMEOUT_MS,
-                    () => null,
-                    'Vector search'
-                ).catch(err => {
-                    if (debug) console.error('[Session Search] Error:', err);
+                ? withTimeout(searchRelevantSessions(prompt, searchQuality), AI_TIMEOUT_MS, () => null, 'Vector search').catch(err => {
+                    if (debug)
+                        console.error('[Session Search] Error:', err);
                     return null;
                 })
                 : Promise.resolve(null),
         ]);
-
         const classifyMs = Date.now() - classifyStart;
         const searchMs = Date.now() - searchStart;
-
         const { result: classification, source: classificationSource } = classificationData;
-
         // Filter out already-activated skills
         const newMandatory = classification.mandatory.filter(s => !alreadyActivated.has(s));
         const newRecommended = classification.recommended.filter(s => !alreadyActivated.has(s));
-
         // Output skill suggestions if there are new ones
         if (newMandatory.length > 0 || newRecommended.length > 0) {
             console.log(generateTieredOutput(newMandatory, newRecommended, classificationSource));
-
             const allNewSkills = [...newMandatory, ...newRecommended];
             updateSessionState(sessionId, state => {
                 state.skills_used = [...new Set([...state.skills_used, ...allNewSkills])];
@@ -842,7 +651,6 @@ async function main() {
                     state.mandatory_pending = [...new Set([...state.mandatory_pending, ...newMandatory])];
                 }
             });
-
             for (const skill of newMandatory) {
                 recordMetric({ event: 'suggested', session: sessionId, skill, level: 'mandatory', source: classificationSource });
             }
@@ -850,7 +658,6 @@ async function main() {
                 recordMetric({ event: 'suggested', session: sessionId, skill, level: 'recommended', source: classificationSource });
             }
         }
-
         // === SESSION CONTEXT INJECTION ===
         if (searchResult) {
             const contextOutput = formatSearchResults(searchResult, searchQuality);
@@ -858,7 +665,6 @@ async function main() {
                 console.log(contextOutput);
             }
         }
-
         // === DEV-DOC UPDATE INJECTION ===
         let reminderStatus = 'none';
         if (process.env.SESSION_DOCS_ENABLED !== 'false') {
@@ -868,9 +674,8 @@ async function main() {
                 reminderStatus = 'reminded';
             }
         }
-
         // === OBSERVABILITY: stderr + activity log ===
-        const intelData: SessionIntelData = {
+        const intelData = {
             ts: new Date().toISOString(),
             session: sessionId,
             skills: {
@@ -891,16 +696,14 @@ async function main() {
             } : null,
             reminder: reminderStatus,
         };
-
         logSessionIntel(intelData);
-
         process.exit(0);
-    } catch (err) {
+    }
+    catch (err) {
         console.error(`skill-activation-prompt: hook failed, continuing without suggestions (${err instanceof Error ? err.message : String(err)})`);
         process.exit(0);
     }
 }
-
 main().catch(err => {
     console.error(`skill-activation-prompt: hook failed, continuing without suggestions (${err instanceof Error ? err.message : String(err)})`);
     process.exit(0);
